@@ -8,6 +8,9 @@
  *   npm start -- "Octopus" "The Beatles"
  */
 import "dotenv/config";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
@@ -22,20 +25,28 @@ const [from = "Octopus", to = "The Beatles"] = process.argv.slice(2);
 
 const WIKI = "https://en.wikipedia.org/w/api.php";
 
-const cache = new Map<string, any>();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** GET the MediaWiki API with caching and polite retry/backoff on 429/5xx. */
+// On-disk cache shared across runs: link graphs barely change, and batch runs hit the same hubs repeatedly.
+const CACHE_DIR = ".cache/wiki";
+mkdirSync(CACHE_DIR, { recursive: true });
+const cachePath = (url: string) => join(CACHE_DIR, createHash("sha1").update(url).digest("hex") + ".json");
+
+// Wikimedia asks API clients to identify themselves; generic agents get throttled harder.
+const USER_AGENT = "six-degrees-raindrop-agent/0.2 (https://github.com/smithclay/six-degrees-raindrop-agent)";
+
+/** GET the MediaWiki API with a disk cache and polite retry/backoff on 429/5xx. */
 async function wiki(params: Record<string, string>): Promise<any> {
   const url = `${WIKI}?${new URLSearchParams({ format: "json", formatversion: "2", maxlag: "5", ...params })}`;
-  if (cache.has(url)) return cache.get(url);
+  const file = cachePath(url);
+  if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "six-degrees-demo-agent/0.1 (local demo; read-only)", "Accept-Encoding": "gzip" },
-    });
+    const res = await fetch(url, { headers: { "User-Agent": USER_AGENT, "Accept-Encoding": "gzip" } });
     if (res.ok) {
       const json = await res.json();
-      cache.set(url, json);
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(json));
+      renameSync(tmp, file); // atomic, safe with concurrent runs
       return json;
     }
     if ((res.status === 429 || res.status >= 500) && attempt < 4) {
@@ -130,10 +141,10 @@ const backlinksTool: AgentTool<any> = {
   label: "Incoming links",
   description:
     "List articles that link TO a given article (incoming). Useful for working backwards from the target. " +
-    "Optionally filter by substring. Samples up to 2000 backlinks.",
+    "Optionally filter by substring. Samples up to 1000 backlinks.",
   parameters: Type.Object({ title: Type.String(), filter: Type.Optional(Type.String()) }),
   async execute(_id, { title, filter }) {
-    const { titles } = await collectLinks(title, "backlinks", 2000);
+    const { titles } = await collectLinks(title, "backlinks", 1000);
     const { hits, shown } = filterAndFormat(titles, filter);
     return {
       content: text(`${titles.length} sampled articles link to "${title}"; ${hits.length} match${filter ? ` "${filter}"` : ""}:\n${shown.join(" | ")}`),
